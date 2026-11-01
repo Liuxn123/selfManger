@@ -1,0 +1,10 @@
+    def test_codex_uses_cancellable_bounded_runner_and_checks_marker(self):
+        from selfManger.ai_task_execution import execute_codex_task, COMPLETION_MARKER
+        with TestDirectory() as directory:
+            with patch("selfManger.ai_task_execution.run_process", return_value="verified\n" + COMPLETION_MARKER) as run:
+                result = execute_codex_task(sys.executable, directory, "audit", {"title": "fixture"}, TaskContext())
+                self.assertEqual(result["summary"], "verified")
+                self.assertTrue(run.call_args.kwargs["kill_tree"])
+            with patch("selfManger.ai_task_execution.run_process", return_value="no completion marker"):
+                with self.assertRaises(UserError):
+                    execute_codex_task(sys.executable, directory, "audit", {"title": "fixture"}, TaskContext())

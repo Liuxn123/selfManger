@@ -1,0 +1,661 @@
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import time
+import threading
+import unittest
+from tests.support import TestDirectory
+from datetime import date, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+from PySide6.QtCore import Qt, QPoint, QDate, QFileSystemWatcher
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QComboBox, QListWidget, QTextEdit, QVBoxLayout, QMessageBox, QCheckBox
+
+from selfManger.domain import Resource
+from selfManger.storage import Store
+from selfManger.runtime import TaskContext
+from selfManger.project_workspaces import ProjectWorkspace
+from selfManger.workbench import Daily, Catalog, TYPES, work_root, project_context, summaries
+from selfManger.planbook import PlanBook
+from selfManger.ui.window import MainWindow
+from selfManger.ui.workbench import CatalogDialog
+from selfManger.ui.agenda import AgendaPanel, MODE_CUSTOM, MODE_MONTH, MODE_WEEK, agenda_period
+
+
+class WorkbenchUITests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        credential_patch = patch("selfManger.security.SecretStore.get", return_value=None)
+        credential_patch.start()
+        self.addCleanup(credential_patch.stop)
+        self.feedback = []
+        # Headless CI must report unexpected feedback instead of waiting forever
+        # for somebody to dismiss a native modal. Individual dialog tests override this.
+        for name in ("warning", "information"):
+            feedback = patch.object(QMessageBox, name, side_effect=lambda *args: self.feedback.append(str(args[1:])) or QMessageBox.StandardButton.Ok)
+            feedback.start()
+            self.addCleanup(feedback.stop)
+        self.temp = TestDirectory()
+        self.root = Path(self.temp.name)
+        self.workspace = ProjectWorkspace(self.root / "workspace")
+        self.workspace.initialize(TaskContext())
+        self.project = self.workspace.create("每日工作", "走通工作入口", True, TaskContext())
+        (self.workspace.root / "myself/.obsidian").mkdir()
+        self.store = Store(self.root / "data")
+        self.store.set_setting("project_workspace", str(self.workspace.root))
+        self.agent = Resource("我的 Codex", "agent", {"engine": "Codex", "record_paths": [str(self.root)], "portable_bundle": True})
+        self.store.save_resource(self.agent)
+        self.daily = Daily(work_root(self.store))
+        self.daily.save(self.daily.template().replace("## 日程\n", "## 日程\n- 09:00 开发\n").replace("## 今日任务\n", "## 今日任务\n- [ ] 验证恢复\n"), None)
+        Catalog(work_root(self.store)).save({"name": "阶段总结 Prompt", "type": "prompt", "projects": [self.project["project_id"]], "agents": [self.agent.id], "tags": ["总结"]}, "人工可编辑正文")
+        self.window = MainWindow(self.store)
+        self.window.show()
+        self.until(lambda: self.window.today_page.report is not None)
+
+    def until(self, predicate):
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            if predicate() and not self.window.jobs:
+                return
+            QTest.qWait(15)
+            time.sleep(.003)
+        self.fail("UI operation timed out: " + str([(t["title"], t["state"], t["result"]) for t in self.store.tasks()[:5]]) + " feedback=" + str(self.feedback))
+
+    def tearDown(self):
+        self.until(lambda: not self.window.jobs and not self.window.today_page.worker and not self.window.catalog_page.worker)
+        self.window.close()
+        self.window.pool.waitForDone(5000)
+        self.app.processEvents()
+        self.temp.cleanup()
+        self.assertEqual(self.feedback, [], "Unexpected GUI feedback in headless test")
+
+    def test_daily_is_default_and_checkbox_and_obsidian_edit_share_original_file(self):
+        self.assertEqual([self.window.navigation.item(i).text() for i in range(7)], ["工作台", "计划", "项目", "Agent", "资源库", "数据安全", "设置"])
+        self.assertIs(self.window.stack.currentWidget(), self.window.today_page)
+        page = self.window.today_page
+        self.assertEqual(page.report["schedule"][0]["text"], "09:00 开发")
+        page.tasks.item(0).setCheckState(Qt.CheckState.Checked)
+        self.until(lambda: "[x] 验证恢复" in self.daily.load()["text"] and page.tasks.isEnabled())
+        # Windows denies rename while Python's read handle is open. Finish our own
+        # observation before simulating the external editor's atomic replacement.
+        page.reload_timer.stop()
+        self.until(lambda: not page.worker)
+        path = Path(self.daily.load()["path"])
+        replacement = path.with_suffix(".tmp")
+        replacement.write_text(self.daily.load()["text"].replace("验证恢复", "Obsidian 修改任务"), encoding="utf-8")
+        # External editors also retry Windows rename sharing violations. Waiting
+        # for our reader alone does not cover antivirus / filesystem notifications.
+        for attempt in range(40):
+            try:
+                replacement.replace(path)
+                break
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 39:
+                    raise
+                self.app.processEvents()
+                time.sleep(.05)
+[redacted path line]
+        with patch("selfManger.ui.workbench.QDesktopServices.openUrl", return_value=True) as opened:
+            page.open_daily()
+            self.assertIn("obsidian://open?", opened.call_args[0][0].toString())
+        self.assertNotIn("Obsidian 修改任务", str(self.store.tasks()))
+
+    def test_today_to_project_stage_summary_and_related_library(self):
+        page = self.window.today_page
+        page.open_project(page.continue_projects.item(0))
+        project_page = self.window.project_page
+        self.until(lambda: bool(project_page.status_text))
+        self.assertEqual(self.window.navigation.currentRow(), self.window.PROJECT)
+        self.assertIn("规划", project_page.stage_label.text())
+        self.assertIn("阶段总结 Prompt", project_page.related_list.item(0).text())
+        def choose(dialog):
+            dialog.findChild(QComboBox).setCurrentText("验证新阶段")
+            listing = dialog.findChildren(QListWidget)[0]
+            listing.item(0).setCheckState(Qt.CheckState.Checked)
+            return QDialog.DialogCode.Accepted
+        with patch("selfManger.ui.projects.QDialog.exec", choose):
+            project_page.edit_stage()
+        self.until(lambda: "验证新阶段" in project_page.stage_label.text())
+        details = project_context(self.workspace.document(self.project["project_id"], "agent/STATUS.md")["text"])
+        self.assertEqual(details["agents"], [self.agent.id])
+        def write(dialog):
+            editor = dialog.findChild(QTextEdit)
+            editor.setPlainText(editor.toPlainText() + "\n完成内容：已验证 GUI 链路。")
+            return QDialog.DialogCode.Accepted
+        with patch("selfManger.ui.projects.QDialog.exec", write):
+            project_page.write_stage_summary()
+        self.until(lambda: "已验证 GUI 链路" in project_page.summary_view.toPlainText())
+        self.assertEqual(len(summaries(self.workspace.document(self.project["project_id"], "agent/HANDOFF.md")["text"])), 1)
+        project_page.show_project_resources()
+        self.until(lambda: self.window.catalog_page.listing.count() == 1)
+        self.assertEqual(self.window.catalog_page.selected()["name"], "阶段总结 Prompt")
+
+    def test_project_cards_source_toggle_menu_and_overview_share_original_files(self):
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        page = self.window.project_page
+        self.until(lambda: bool(page.status_text))
+        self.assertEqual(page.metrics[1].value.text(), "0 / 1")
+        self.assertIn("走通工作入口", page.overview.previews["goals"].toPlainText())
+        version = page.document_version
+        page.overview.toggle.click()
+        self.assertEqual(page.overview.stack.currentIndex(), 1)
+        self.assertIn("走通工作入口", page.views[0].toPlainText())
+        page.overview.toggle.click()
+        self.assertEqual(page.overview.stack.currentIndex(), 0)
+        self.assertEqual(page.document_version, version)
+        with patch("selfManger.ui.projects.QDesktopServices.openUrl", return_value=True) as opened:
+            page.more_actions[page.open_button].trigger()
+            self.assertEqual(Path(opened.call_args[0][0].toLocalFile()), Path(self.project["directory"]))
+        status_path = Path(self.project["directory"]) / "agent/STATUS.md"
+        status_path.write_text(page.status_text.replace("走通工作入口", "外部修改目标"), encoding="utf-8")
+        self.until(lambda: "外部修改目标" in page.overview.previews["goals"].toPlainText())
+        self.assertIn("外部修改目标", page.views[0].toPlainText())
+        self.window.resize(960, 700)
+        QTest.qWait(150)
+        for control in (page.summary_button, page.log_button, page.more_button):
+            self.assertGreaterEqual(control.width(), control.minimumSizeHint().width())
+            self.assertTrue(page.hero.rect().contains(control.geometry().bottomRight()))
+        self.assertFalse(page.hero.geometry().intersects(page.metrics_row.geometry()))
+
+    def test_library_create_search_favorite_and_external_edit_do_not_store_body_in_sqlite(self):
+        self.window.navigation.setCurrentRow(self.window.LIBRARY)
+        page = self.window.catalog_page
+        self.until(lambda: len(page.items) == 1)
+        def fill(dialog):
+            dialog.fields["name"].setText("GitHub MCP 说明")
+            dialog.kind.setCurrentIndex(dialog.kind.findData("mcp"))
+            dialog.flags["tested"].setChecked(True)
+            dialog.body.setPlainText("fixture-private-resource-body\n\n## 安装说明\n人工配置")
+            return QDialog.DialogCode.Accepted
+        with patch.object(CatalogDialog, "exec", fill):
+            page.edit_item(None)
+        self.until(lambda: len(page.items) == 2)
+        page.search.setText("人工配置")
+        self.assertEqual(page.listing.count(), 1)
+        self.assertEqual(page.selected()["type"], "mcp")
+        page.toggle_favorite()
+        self.until(lambda: page.selected()["metadata"].get("favorite"))
+        item = page.selected()
+        Path(item["path"]).write_text(item["text"].replace("人工配置", "外部新配置"), encoding="utf-8")
+        page.search.clear()
+        self.until(lambda: any("外部新配置" in i["body"] for i in page.items))
+        self.assertNotIn("fixture-private-resource-body", str(self.store.tasks()))
+        self.assertNotIn(b"fixture-private-resource-body", self.store.path.read_bytes())
+
+    def test_library_filter_detail_and_settings_status_are_connected(self):
+        self.window.navigation.setCurrentRow(self.window.LIBRARY)
+        page = self.window.catalog_page
+        self.until(lambda: len(page.items) == 1)
+        self.assertEqual(page.category_list.count(), len(TYPES) + 2)
+        self.assertEqual(page.listing.count(), 1)
+        self.assertIn("阶段总结 Prompt", page.detail_title.text())
+        self.assertIn("关联 Agent", page.detail_facts.text())
+
+        self.window.navigation.setCurrentRow(self.window.SETTINGS)
+        self.assertEqual(self.window.stack.currentWidget().objectName(), "SettingsPage")
+        destination = self.root / "future-backups"
+        self.window.backup_path.setText(str(destination))
+        self.window.save_settings()
+        self.assertEqual(Path(self.store.setting("backup_root")), destination.resolve())
+        self.assertIn("首次备份时创建", self.window.settings_backup_status.text())
+        self.assertEqual(Path(self.window.backup_location.toPlainText()), destination.resolve())
+
+
+    def test_plan_page_has_week_and_month_ranges_and_reuses_daily_markdown(self):
+        week = date(2028, 2, 29)
+        self.assertEqual(agenda_period(MODE_WEEK, week), (date(2028, 2, 28), date(2028, 3, 5)))
+        self.assertEqual(agenda_period(MODE_MONTH, week), (date(2028, 2, 1), date(2028, 2, 29)))
+
+        self.window.today_page.agenda_button.click()
+        self.assertEqual(self.window.navigation.currentRow(), self.window.PLAN)
+        page = self.window.planning_page
+        self.until(lambda: not page.agenda.worker and len(page.agenda.rows) == 2)
+        self.assertEqual(page.tabs.count(), 4)
+        self.assertEqual([metric.title.text() for metric in page.dashboard.metrics],
+                         ["本周计划", "本月重点项目", "里程碑", "周期任务"])
+        self.assertFalse(page.tabs.tabBar().isVisible())
+        self.assertEqual(page.dashboard.view_mode, MODE_WEEK)
+        page.dashboard.set_view(MODE_MONTH)
+        self.until(lambda: not page.agenda.worker and len(page.agenda.rows) == 2)
+        self.assertEqual(page.agenda.query()[:2], agenda_period(MODE_MONTH, page.dashboard.anchor))
+        selected = date.today() + timedelta(days=2)
+        page.dashboard.set_view(MODE_CUSTOM)
+        page.dashboard.date_control.setDate(QDate(selected.year, selected.month, selected.day))
+        self.assertEqual(page.agenda.query()[:2], (selected, selected))
+        self.until(lambda: not page.agenda.worker)
+        page.dashboard.show_current_week()
+        self.until(lambda: not page.agenda.worker and len(page.agenda.rows) == 2)
+        item = next(i for i, row in enumerate(page.agenda.rows) if row["kind"] == "任务")
+        page.agenda.table.selectRow(item)
+        page.agenda.open_selected()
+        self.assertEqual(self.window.navigation.currentRow(), self.window.TODAY)
+        self.until(lambda: self.window.today_page.report and self.window.today_page.report["day"] == date.today().isoformat())
+
+    def test_plan_goals_milestones_recurring_tasks_and_templates_use_markdown(self):
+        book = PlanBook(work_root(self.store))
+        due = date.today().isoformat()
+        book.save("goal", {"title": "年度目标", "status": "active", "due": due}, "目标正文")
+        book.save("milestone", {"title": "首期验收", "status": "planned", "due": due,
+                                 "project_id": self.project["project_id"]}, "验收内容")
+        book.save("recurring", {"title": "每日复盘", "status": "planned", "start": due,
+                                 "due": due, "frequency": "daily"}, "周期任务说明")
+        book.save("template", {"title": "开始工作", "status": "planned"}, "## 今日任务\n\n- 检查计划页\n")
+
+        self.window.navigation.setCurrentRow(self.window.PLAN)
+        page = self.window.planning_page
+        self.until(lambda: not page.agenda.worker and
+                   any(row["kind"] == "里程碑" for row in page.agenda.rows) and
+                   any(row["kind"] == "周期任务" for row in page.agenda.rows))
+        cycle_row = next(i for i, row in enumerate(page.agenda.rows) if row["kind"] == "周期任务")
+        page.agenda.table.selectRow(cycle_row)
+        self.assertTrue(page.agenda.add_occurrence_button.isEnabled())
+        page.agenda.add_occurrence_button.click()
+        self.until(lambda: "↻ 每日复盘" in Daily(work_root(self.store)).load()["text"] and
+                   not page.agenda.worker and not self.window.jobs)
+        self.assertFalse(any(row["kind"] == "周期任务" and row["day"] == due for row in page.agenda.rows))
+
+        page.tabs.setCurrentIndex(2)
+        records = page.records
+        self.until(lambda: not records.worker and len(records.items) == 4)
+        records.kind.setCurrentIndex(records.kind.findData("template"))
+        self.assertEqual(len(records.filtered), 1)
+        records.table.selectRow(0)
+        self.assertTrue(records.apply_button.isEnabled())
+        records.target_day.setDate(QDate.currentDate())
+        records.apply_button.click()
+        self.until(lambda: "检查计划页" in Daily(work_root(self.store)).load()["text"] and not self.window.jobs)
+
+    def test_project_timeline_filters_and_orders_linked_plan_records(self):
+        book = PlanBook(work_root(self.store))
+        project_id = self.project["project_id"]
+        book.save("milestone", {"title": "后续里程碑", "status": "planned", "due": "2030-06-20",
+                                 "project_id": project_id}, "后续内容")
+        book.save("goal", {"title": "项目目标", "status": "active", "start": "2030-06-01",
+                            "project_id": project_id}, "目标详情")
+        book.save("milestone", {"title": "其他项目事项", "status": "planned", "due": "2030-06-10",
+                                 "project_id": "P-OTHER"}, "其他内容")
+        page = self.window.planning_page
+        page.tabs.setCurrentIndex(3)
+        self.until(lambda: not page.timeline.worker and len(page.timeline.items) == 3)
+        timeline = page.timeline
+        self.assertEqual(timeline.project.count(), 3)
+        timeline.project.setCurrentIndex(timeline.project.findData(project_id))
+        self.assertEqual([timeline.filtered[row]["title"] for row in range(len(timeline.filtered))],
+                         ["项目目标", "后续里程碑"])
+        self.assertEqual(timeline.filtered[0]["metadata"]["start"], "2030-06-01")
+        self.assertEqual(timeline.filtered[1]["metadata"]["due"], "2030-06-20")
+
+    def test_safety_workspace_selects_agent_and_exposes_existing_backup_actions(self):
+        self.window.navigation.setCurrentRow(self.window.SAFETY)
+        self.window.safety_kind.setCurrentIndex(3)
+        self.app.processEvents()
+        self.assertEqual(self.window.safety_resource_choice.currentData(), self.agent.id)
+        self.assertEqual(self.window.safety_resource_choice.currentText(), self.agent.name)
+        self.assertTrue(self.window.safety_observe_button.isEnabled())
+        self.assertTrue(self.window.safety_backup_button.isEnabled())
+        self.assertTrue(self.window.safety_verify_button.isEnabled())
+        self.assertTrue(self.window.safety_restore_button.isEnabled())
+        self.assertEqual(self.window.safety_resources.currentIndex(), 3)
+        self.assertEqual(self.window.safety_tabs.tabText(1), "备份历史 / 换电脑")
+
+    def test_change_notes_location_keeps_old_files_and_engine_resource_filter_and_url_guard(self):
+        old = Path(self.daily.load()["path"])
+        before = old.read_bytes()
+        destination = self.root / "portable-notes"
+        destination.mkdir()
+        with patch("selfManger.ui.window.QFileDialog.getExistingDirectory", return_value=str(destination)):
+            self.window.change_workbench_location()
+        self.until(lambda: not self.window.today_page.worker and not self.window.catalog_page.worker)
+        self.assertEqual(work_root(self.store).resolve(), destination.resolve())
+        self.assertEqual(old.read_bytes(), before)
+        Catalog(destination).save({"name": "适用 Codex", "type": "skill", "agents": ["codex"]}, "说明")
+        self.window.catalog_page.agent_filter = self.agent.id
+        self.window.navigation.setCurrentRow(self.window.LIBRARY)
+        self.until(lambda: self.window.catalog_page.listing.count() == 1)
+        from PySide6.QtCore import QUrl
+        with patch("selfManger.ui.workbench.QDesktopServices.openUrl") as opened, patch("selfManger.ui.workbench.QMessageBox.information"):
+            self.window.catalog_page.safe_url(QUrl("file:///C:/not-a-website.exe"))
+            opened.assert_not_called()
+
+    def test_closing_window_during_daily_read_does_not_reopen_sqlite(self):
+        gate, entered = threading.Event(), threading.Event()
+        original = Daily.load
+        def delayed(daily):
+            entered.set()
+            gate.wait(3)
+            return original(daily)
+        self.until(lambda: not self.window.today_page.worker)
+        with patch.object(Daily, "load", delayed):
+            self.window.today_page.refresh()
+            self.until(entered.is_set)
+            self.window.close()
+            with patch.object(self.store, "setting", side_effect=AssertionError("Closed daily read must not open SQLite")) as reopened:
+                gate.set()
+                self.until(lambda: not self.window.today_page.worker)
+                reopened.assert_not_called()
+
+
+    def test_missing_task_file_keeps_status_logs_and_notes_usable(self):
+        tasks = Path(self.project["directory"]) / "agent/TASKS.md"
+        tasks.unlink()
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        page = self.window.project_page
+        self.until(lambda: 1 in page.document_errors)
+        self.assertIn("走通工作入口", page.overview.previews["goals"].toPlainText())
+        self.assertIn("无法读取", page.views[1].toPlainText())
+        self.assertTrue(page.log_button.isEnabled())
+        page.documents.setCurrentIndex(1)
+        self.assertFalse(page.edit_button.isEnabled())
+        self.assertFalse(tasks.exists())
+        self.assertNotIn("读取中", page.stage_label.text())
+
+    def test_empty_workspace_has_explicit_guidance_and_no_active_project_actions(self):
+        self.store.set_setting("project_workspace", "")
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        self.until(lambda: not self.window.jobs)
+        page = self.window.project_page
+        self.assertEqual(page.table.rowCount(), 0)
+        self.assertIn("先选择", page.project_name.text())
+        for control in (page.new_button, page.resource_button, page.summary_button, page.log_button, page.more_button):
+            self.assertFalse(control.isEnabled())
+        self.assertIn(str(self.store.root), page.message.text())
+
+    def test_new_project_is_selected_even_after_search_and_keeps_previous_project(self):
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        page = self.window.project_page
+        self.until(lambda: bool(page.status_text))
+        page.search.setText("不存在的项目")
+        def fill(dialog):
+            dialog.name.setText("新初始化项目")
+            dialog.goal.setPlainText("验证项目能立即找到")
+            dialog.entry.setChecked(False)
+            return QDialog.DialogCode.Accepted
+        with patch("selfManger.ui.projects.ProjectDialog.exec", fill), patch("selfManger.ui.projects.QMessageBox.information"):
+            page.new_button.click()
+            self.until(lambda: page.selected() is not None and page.selected()["name"] == "新初始化项目" and bool(page.status_text))
+        self.assertEqual(page.search.text(), "")
+        self.assertEqual(len(self.workspace.list_projects(TaskContext())["projects"]), 2)
+
+    def test_archive_and_resume_release_all_watchers_and_keep_payload_and_entry(self):
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        page = self.window.project_page
+        self.until(lambda: bool(page.status_text) and not self.window.today_page.worker)
+        source = Path(self.project["directory"])
+        (source / "payload.bin").write_bytes(bytes(range(256)))
+        item = self.workspace.project(self.project["project_id"])
+        entry = self.workspace.root / item["vault_entry"]
+        def confirm(dialog):
+            dialog.findChild(QTextEdit).setPlainText("GUI 归档与接续验证")
+            dialog.findChild(QCheckBox).setChecked(True)
+            return QDialog.DialogCode.Accepted
+        for resume in (False, True):
+            with patch("selfManger.ui.projects.QDialog.exec", confirm):
+                page.more_actions[page.move_button].trigger()
+                expected = "projects/" if resume else "archive/"
+                self.until(lambda: page.selected() and page.selected()["path"].startswith(expected) and bool(page.status_text) and not page.move_watchers)
+            destination = Path(page.selected()["directory"])
+            self.assertEqual((destination / "payload.bin").read_bytes(), bytes(range(256)))
+            self.assertEqual(entry.resolve(), destination.resolve())
+            self.assertEqual(page.selected()["id"], self.project["project_id"])
+            self.assertIn(str(destination), page.watcher.directories())
+            self.assertFalse(any(w.property("projectMovePaused") for w in self.window.findChildren(QFileSystemWatcher)))
+
+    def test_failed_archive_restores_watchers_and_rejects_late_watch_registration(self):
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        page = self.window.project_page
+        self.until(lambda: bool(page.status_text) and not self.window.today_page.worker)
+        source = Path(self.project["directory"])
+        original = self.workspace.manifest(source, TaskContext())
+        def confirm(dialog):
+            dialog.findChild(QTextEdit).setPlainText("失败清理验证")
+            dialog.findChild(QCheckBox).setChecked(True)
+            return QDialog.DialogCode.Accepted
+        def fail_move(*args):
+            raise OSError("injected move failure")
+        with patch("selfManger.ui.projects.QDialog.exec", confirm), patch.object(ProjectWorkspace, "move", fail_move), patch.object(QMessageBox, "warning") as warning:
+            page.move_project()
+            self.until(lambda: warning.called and not page.move_watchers and bool(page.status_text))
+        self.assertEqual(self.workspace.manifest(source, TaskContext()), original)
+        self.assertIn(str(source), page.watcher.directories())
+        self.assertTrue(page.move_button.isEnabled())
+        page.pause_move_watches()
+        try:
+            page.update_watches([str(source)])
+            self.window.today_page.watch([str(source)])
+            self.assertFalse(page.watcher.directories())
+            self.assertFalse(self.window.today_page.watcher.directories())
+        finally:
+            page.restore_move_watches()
+
+    def test_legacy_archive_opens_clear_continuation_dialog_and_preserves_original(self):
+        import json
+        # Convert an isolated numbered archive into a valid historical fixture.
+        page = self.window.project_page
+        self.until(lambda: not self.window.today_page.worker)
+        page.pause_move_watches()
+        try:
+            original = self.workspace.move(self.workspace.plan_move(self.project["project_id"], False, TaskContext()), "fixture", TaskContext())
+        finally:
+            page.restore_move_watches()
+        path = Path(original["directory"])
+        data = self.workspace.registry()
+        item = data["projects"][0]
+        old_id = item["id"]
+        item.update(id="L-每日工作", legacy=True)
+        status = path / "agent/STATUS.md"
+        status.write_text(status.read_text(encoding="utf-8").replace(old_id, item["id"]), encoding="utf-8")
+        self.workspace.registry_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        before = self.workspace.manifest(path, TaskContext())
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        page = self.window.project_page
+        page.filter.setCurrentIndex(1)
+        page.refresh()
+        self.until(lambda: page.selected() and page.selected().get("legacy") and bool(page.status_text))
+        page.update_selection_actions()
+        self.assertEqual(page.more_actions[page.move_button].text(), "从旧归档继续…")
+        self.assertTrue(page.more_actions[page.move_button].isEnabled())
+        def fill(dialog):
+            self.assertIn("从旧归档继续", dialog.windowTitle())
+            self.assertEqual(dialog.name.text(), "每日工作-接续")
+            self.assertIn(str(path), dialog.goal.toPlainText())
+            dialog.entry.setChecked(False)
+            return QDialog.DialogCode.Accepted
+        with patch("selfManger.ui.projects.ProjectDialog.exec", fill), patch.object(QMessageBox, "information"):
+            page.more_actions[page.move_button].trigger()
+            self.until(lambda: page.selected() and page.selected()["name"] == "每日工作-接续" and bool(page.status_text))
+        self.assertTrue(page.selected()["id"].startswith("P-"))
+        self.assertEqual(self.workspace.manifest(path, TaskContext()), before)
+        self.assertTrue(self.workspace.project("L-每日工作")["legacy"])
+
+    def test_scoped_resource_create_inherits_project_and_survives_previous_filters(self):
+        self.window.navigation.setCurrentRow(self.window.PROJECT)
+        project = self.window.project_page
+        self.until(lambda: bool(project.status_text))
+        page = self.window.catalog_page
+        page.search.setText("找不到")
+        page.kind.setCurrentIndex(page.kind.findData("mcp"))
+        page.favorite.setChecked(True)
+        project.resource_button.click()
+        self.until(lambda: page.listing.count() == 1)
+        def fill(dialog):
+            self.assertEqual(dialog.fields["projects"].text(), self.project["project_id"])
+            dialog.fields["name"].setText("项目专属 Skill")
+            dialog.kind.setCurrentIndex(dialog.kind.findData("skill"))
+            return QDialog.DialogCode.Accepted
+        with patch.object(CatalogDialog, "exec", fill):
+            page.edit_item(None)
+        self.until(lambda: page.listing.count() == 2)
+        self.assertEqual(page.selected()["name"], "项目专属 Skill")
+        self.assertIn("项目专属 Skill", page.preview.toPlainText())
+        entry = next(i for i in page.items if i["name"] == "项目专属 Skill")
+        self.assertEqual(entry["metadata"]["projects"], [self.project["project_id"]])
+        page.search.setText("找不到")
+        page.favorite.setChecked(True)
+        page.clear_scope()
+        self.assertEqual(page.listing.count(), 2)
+
+    def test_invalid_project_workspace_does_not_hide_today_plan(self):
+        self.store.set_setting("project_workspace", str(self.root / "missing-workspace"))
+        self.store.set_setting("workbench_root", str(self.daily.files.root))
+        self.window.today_page.refresh()
+        self.until(lambda: any("工作区需要检查" in error for error in self.window.today_page.project_errors))
+        self.assertEqual(self.window.today_page.tasks.item(0).text(), "验证恢复")
+        self.assertTrue(self.window.today_page.edit_button.isEnabled())
+
+
+
+    def test_daily_refreshes_even_when_atomic_save_notification_is_missed(self):
+        page = self.window.today_page
+        self.until(lambda: not page.worker)
+        page.watcher.blockSignals(True)
+        path = Path(self.daily.load()["path"])
+        old_count = len(self.store.tasks())
+        path.write_text(self.daily.load()["text"].replace("验证恢复", "兜底刷新任务"), encoding="utf-8")
+        self.until(lambda: "兜底刷新任务" in page.tasks.item(0).text())
+        self.assertEqual(len(self.store.tasks()), old_count)
+        page.watcher.blockSignals(False)
+
+    def test_quick_add_and_mouse_checkbox_update_real_file_and_counts(self):
+        page = self.window.today_page
+        def fill(dialog):
+            dialog.title.setText("关键恢复检查")
+            return QDialog.DialogCode.Accepted
+        with patch("selfManger.ui.workbench.DailyEntryDialog.exec", fill):
+            page.add_entry("今日任务")
+        self.until(lambda: len(page.report["tasks"]) == 2)
+        self.assertIn("关键恢复检查", self.daily.load()["text"])
+        self.assertEqual(page.metrics[0].value.text(), "0 / 2")
+        item = page.tasks.item(1)
+        rectangle = page.tasks.visualItemRect(item)
+        QTest.mouseClick(page.tasks.viewport(), Qt.MouseButton.LeftButton, pos=rectangle.topLeft() + QPoint(12, 20))
+        self.until(lambda: "[x] 关键恢复检查" in self.daily.load()["text"] and page.tasks.isEnabled())
+        self.assertEqual(page.metrics[0].value.text(), "1 / 2")
+        self.assertNotIn("关键恢复检查", str(self.store.tasks()))
+
+
+    def test_future_entry_date_navigation_and_completion_preserve_today(self):
+        page = self.window.today_page
+        future = date.today() + timedelta(days=9)
+        original = self.daily.load()["text"]
+        def fill(dialog):
+            dialog.date.setDate(QDate(future.year, future.month, future.day))
+            dialog.title.setText("未来验证")
+            return QDialog.DialogCode.Accepted
+        with patch("selfManger.ui.workbench.DailyEntryDialog.exec", fill):
+            page.add_entry("今日任务")
+        self.until(lambda: page.report and page.report["day"] == future.isoformat())
+        self.assertEqual(self.daily.load()["text"], original)
+        self.assertIn("当日", page.task_card.title.text())
+        self.assertEqual(page.date_picker.date().toPython(), future)
+        self.assertEqual(page.day, future)
+        page.tasks.item(0).setCheckState(Qt.CheckState.Checked)
+        planned = Daily(self.daily.files.root, future)
+        self.until(lambda: "[x] 未来验证" in planned.load()["text"] and page.tasks.isEnabled())
+        self.assertEqual(self.daily.load()["text"], original)
+        page.today_button.click()
+        self.until(lambda: page.report and page.report["day"] == date.today().isoformat())
+        self.assertIn("验证恢复", page.tasks.item(0).text())
+
+    def test_late_response_after_date_switch_is_ignored_and_future_browsing_creates_no_file(self):
+        page = self.window.today_page
+        stale = page.report
+        target = date.today() + timedelta(days=12)
+        page.set_day(target)
+        page.render_daily(stale)
+        self.assertIsNone(page.report)
+        self.assertFalse(page.tasks.isEnabled())
+        self.until(lambda: page.report and page.report["day"] == target.isoformat())
+        self.assertEqual(page.report["tasks"], [])
+        self.assertFalse(Path(page.report["path"]).exists())
+
+    def test_manual_refresh_keeps_deliberately_selected_date(self):
+        page = self.window.today_page
+        future = date.today() + timedelta(days=4)
+        page.set_day(future)
+        self.until(lambda: page.report and page.report["day"] == future.isoformat())
+        page.manual_refresh()
+        self.until(lambda: page.report and page.report["day"] == future.isoformat() and not page.worker)
+        self.assertEqual(page.day, future)
+
+    def test_agenda_selected_date_add_preserves_existing_plan_and_invalid_range_blocks_open(self):
+        future = date.today() + timedelta(days=6)
+        planned = Daily(self.daily.files.root, future)
+        planned.add_entry("今日任务", "保留原计划", None)
+        dialog = QDialog(self.window)
+        layout = QVBoxLayout(dialog)
+        panel = AgendaPanel(self.window, self.window.today_page, dialog)
+        layout.addWidget(panel)
+        dialog.show()
+        panel.refresh()
+        try:
+            self.until(lambda: len(panel.rows) == 3)
+            row = next(i for i, entry in enumerate(panel.rows) if entry["day"] == future.isoformat())
+            panel.table.selectRow(row)
+            def fill(entry):
+                self.assertEqual(entry.date.date().toPython(), future)
+                entry.title.setText("追加未来日程")
+                entry.time.setText("16:00")
+                return QDialog.DialogCode.Accepted
+            with patch("selfManger.ui.workbench.DailyEntryDialog.exec", fill):
+                panel.add("日程")
+            self.until(lambda: any(entry["title"] == "16:00 追加未来日程" for entry in panel.rows))
+            self.assertIn("保留原计划", planned.load()["text"])
+            self.assertNotIn("追加未来日程", self.daily.load()["text"])
+            panel.mode.setCurrentIndex(3)
+            panel.start.setDate(QDate.currentDate().addDays(7))
+            panel.end.setDate(QDate.currentDate())
+            self.until(lambda: not panel.worker)
+            self.assertIn("开始日期", panel.status.text())
+            self.assertFalse(panel.table.isEnabled())
+            self.assertFalse(panel.open_button.isEnabled())
+        finally:
+            panel.stop_updates()
+            self.until(lambda: not panel.worker)
+            dialog.close()
+
+    def test_agenda_filters_and_external_edit_open_matching_date(self):
+        past = date.today() - timedelta(days=3)
+        future = date.today() + timedelta(days=5)
+        for day in (past, future):
+            Daily(self.daily.files.root, day).add_entry("今日任务", "跨日任务", None)
+        dialog = QDialog(self.window)
+        panel = AgendaPanel(self.window, self.window.today_page, dialog)
+        dialog.setLayout(QVBoxLayout())
+        dialog.layout().addWidget(panel)
+        dialog.show()
+        panel.refresh()
+        try:
+            self.until(lambda: len(panel.rows) == 3)
+            self.assertNotIn(past.isoformat(), [row["day"] for row in panel.rows])
+            panel.mode.setCurrentIndex(1)
+            self.until(lambda: len(panel.rows) == 3 and any(row["day"] == past.isoformat() for row in panel.rows))
+            self.assertTrue(all(row["kind"] == "任务" for row in panel.rows))
+            planned = Daily(self.daily.files.root, future)
+            report = planned.load()
+            planned.save(report["text"].replace("跨日任务", "Obsidian 改未来"), report["original"])
+            self.until(lambda: any(row["title"] == "Obsidian 改未来" for row in panel.rows))
+            row = next(i for i, entry in enumerate(panel.rows) if entry["day"] == future.isoformat())
+            panel.table.selectRow(row)
+            panel.open_button.click()
+            self.until(lambda: self.window.today_page.report and self.window.today_page.report["day"] == future.isoformat())
+            self.assertIn("Obsidian 改未来", self.window.today_page.tasks.item(0).text())
+        finally:
+            panel.stop_updates()
+            self.until(lambda: not panel.worker)
+            dialog.close()
+
+    def test_small_window_keeps_project_and_tasks_in_view_without_header_clipping(self):
+        page = self.window.today_page
+        self.window.resize(960, 700)
+        QTest.qWait(150)
+        self.assertEqual(page.columns_layout.getItemPosition(page.columns_layout.indexOf(page.task_card))[:2], (0, 0))
+        self.assertEqual(page.columns_layout.getItemPosition(page.columns_layout.indexOf(page.top_side))[:2], (1, 0))
+        self.assertEqual(page.columns_layout.getItemPosition(page.columns_layout.indexOf(page.project_card))[:2], (2, 0))
+        self.assertGreaterEqual(page.edit_button.width(), page.edit_button.minimumSizeHint().width())
+        self.assertTrue(page.task_card.isVisible())
+        self.assertTrue(page.project_card.isVisible())

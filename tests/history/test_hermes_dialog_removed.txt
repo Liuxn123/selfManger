@@ -1,0 +1,21 @@
+    def test_hermes_dialog_reads_selected_content_without_persisting_conversations(self):
+        resource = Resource("测试 Hermes", "hermes_local", {"home": str(self.root)})
+        self.store.save_resource(resource)
+        with closing(sqlite3.connect(self.root / "state.db")) as db, db:
+            db.executescript("CREATE TABLE sessions(id TEXT,title TEXT,started_at REAL);"
+                             "CREATE TABLE messages(id INTEGER,session_id TEXT,role TEXT,content TEXT);"
+                             "INSERT INTO sessions VALUES('sample','测试会话',1);"
+                             "INSERT INTO messages VALUES(1,'sample','user','fixture-private-Hermes-message');")
+        report = self.window.service.action(resource, "library", TaskContext())
+        dialog = HermesLibraryDialog(self.window, resource, report)
+        dialog.show()
+        dialog.table.selectRow(0)
+        with patch("selfManger.ui.window.QMessageBox.warning") as warnings:
+            deadline = time.monotonic() + 10
+            while "fixture-private-Hermes-message" not in dialog.preview.toPlainText() and time.monotonic() < deadline:
+                QTest.qWait(20)
+                time.sleep(0.005)
+            self.assertFalse(warnings.called)
+        self.assertIn("fixture-private-Hermes-message", dialog.preview.toPlainText())
+        self.assertNotIn("fixture-private-Hermes-message", str(self.store.tasks()))
+        dialog.reject()

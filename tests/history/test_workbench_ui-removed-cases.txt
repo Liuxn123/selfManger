@@ -1,0 +1,75 @@
+Archived cases for removed UI/physical relocation interfaces.
+
+    def test_existing_agent_opens_same_safety_registration_and_daily_has_no_backup_controls(self):
+        self.window.navigation.setCurrentRow(self.window.AGENT)
+        self.window.agent_page.refresh(self.agent.id)
+        self.window.agent_page.safety()
+        self.assertEqual(self.window.navigation.currentRow(), self.window.SAFETY)
+        self.assertEqual(self.window.resource_pages[3].selected().id, self.agent.id)
+        self.assertEqual(self.window.safety_tabs.currentIndex(), 0)
+        self.assertFalse(self.window.timer.isActive())
+
+    def test_manual_agent_without_directory_does_not_open_current_working_folder(self):
+        manual = Resource("未配置的新 Agent", "agent", {})
+        self.store.save_resource(manual)
+        self.window.agent_page.refresh(manual.id)
+        with patch.object(self.window, "open_path") as opened, patch("selfManger.ui.workbench.QMessageBox.information"):
+            self.window.agent_page.open_agent()
+            self.window.agent_page.directory()
+            opened.assert_not_called()
+        self.assertEqual(len(self.store.resources()), 2)
+
+    def test_failed_folder_open_shows_feedback_and_does_not_record_agent_use(self):
+        self.window.agent_page.refresh(self.agent.id)
+        with patch("selfManger.ui.window.QDesktopServices.openUrl", return_value=False), patch("selfManger.ui.window.QMessageBox.warning") as warning:
+            self.window.agent_page.open_agent()
+            warning.assert_called_once()
+        self.assertFalse(self.store.evidence("agent-used:" + self.agent.id))
+        self.store.remove_resource(self.agent.id)
+        self.window.agent_page.refresh()
+        self.assertTrue(all(not action.isEnabled() for action in self.window.agent_page.actions))
+
+    def test_agent_note_save_opens_saved_markdown_in_library_after_location_change(self):
+        location = self.root / "new-notes"
+        self.store.set_setting("workbench_root", str(location))
+        self.window.navigation.setCurrentRow(self.window.AGENT)
+        self.window.agent_page.refresh(self.agent.id)
+        def fill(dialog):
+            dialog.body.setPlainText("Agent 备注保存验证")
+            return QDialog.DialogCode.Accepted
+        with patch.object(CatalogDialog, "exec", fill):
+            self.window.agent_page.notes()
+            self.until(lambda: self.window.navigation.currentRow() == self.window.LIBRARY and self.window.catalog_page.listing.count() == 1)
+        self.assertIn("Agent 备注保存验证", self.window.catalog_page.preview.toPlainText())
+        self.assertEqual(Catalog(location).scan()["items"][0]["metadata"]["agents"], [self.agent.id])
+        self.window.navigation.setCurrentRow(self.window.AGENT)
+        def edit(dialog):
+            self.assertIn("Agent 备注保存验证", dialog.body.toPlainText())
+            dialog.body.setPlainText("Agent 备注更新验证")
+            return QDialog.DialogCode.Accepted
+        with patch.object(CatalogDialog, "exec", edit):
+            self.window.agent_page.notes()
+            self.until(lambda: self.window.navigation.currentRow() == self.window.LIBRARY and "更新验证" in self.window.catalog_page.preview.toPlainText())
+        self.assertEqual(len(Catalog(location).scan()["items"]), 1)
+
+    def test_dashboard_matches_prototype_sections_and_recent_agent_opens_detail(self):
+        page = self.window.today_page
+        self.assertEqual([metric.title.text() for metric in page.metrics],
+                         ["今日任务", "进行中项目", "运行中的 Agent", "待处理事项"])
+        self.assertEqual([page.task_views.tabText(index).split(" · ")[0] for index in range(3)],
+                         ["任务", "日程", "Todo"])
+        self.assertEqual(page.schedule_items.item(0).text(), "09:00 开发")
+        self.assertEqual(page.project_card.title.text(), "今日项目动态  (1)")
+
+        page.render_agent_activity([(0, "codex", self.agent, True, "检测到运行进程 · PID 1234")])
+        self.assertEqual(page.metrics[2].value.text(), "1 / 1")
+        self.assertIn("运行中", page.agent_items.item(0).text())
+
+        self.store.save_evidence("project-used:" + self.project["project_id"], {"at": "2026-10-11T09:00:00+08:00"})
+        self.store.save_evidence("agent-used:" + self.agent.id, {"at": "2026-10-11T10:00:00+08:00"})
+        page.render_recent()
+        self.assertEqual(len(page.recent_buttons), 2)
+        next(button for button in page.recent_buttons if button.text().startswith(self.agent.name)).click()
+        self.assertEqual(self.window.navigation.currentRow(), self.window.AGENT)
+        self.assertEqual(self.window.agent_page.selected().id, self.agent.id)
+

@@ -1,0 +1,214 @@
+
+# tests/test_services.py :: test_ssh_host_injection_and_unknown_host_trust_are_rejected
+    def test_ssh_host_injection_and_unknown_host_trust_are_rejected(self):
+        for host in ["-oProxyCommand=bad", "alias;whoami", "alias name", "host\ncommand"]:
+            with self.assertRaises(UserError):
+                ssh_command(Resource("server", "hermes_server", {"host": host}), {"action": "observe"})
+        command = ssh_command(Resource("server", "hermes_server", {"host": "my-hermes"}), {"action": "observe"})
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertIn("BatchMode=yes", command)
+        compile(SERVER_PROGRAM, "remote_worker", "exec")
+
+# tests/test_services.py :: test_agent_start_stop_only_controls_owned_process
+    def test_agent_start_stop_only_controls_owned_process(self):
+        resource = Resource("test agent", "agent", {"path": str(self.root), "executable": sys.executable,
+                            "arguments": ["-c", "import time;time.sleep(60)"]})
+        adapter = AgentAdapter()
+        self.addCleanup(lambda: adapter.stop(resource, TaskContext()) if adapter.is_running(resource) else None)
+        self.assertTrue(adapter.start(resource, TaskContext())["started"])
+        self.assertTrue(adapter.is_running(resource))
+        with self.assertRaises(UserError):
+            adapter.start(resource, TaskContext())
+        self.assertTrue(adapter.stop(resource, TaskContext())["stopped"])
+        self.assertFalse(adapter.is_running(resource))
+        with self.assertRaises(UserError):
+            adapter.stop(Resource("unknown", "agent", {"path": str(self.root)}), TaskContext())
+
+# tests/test_performance.py :: test_shared_inventory_retains_native_and_node_agents_without_reading_unrelated_commands
+    def test_shared_inventory_retains_native_and_node_agents_without_reading_unrelated_commands(self):
+        codex = Resource("Codex", "agent", {"engine": "Codex"})
+        claude = Resource("Claude", "agent", {"engine": "Claude Code"})
+        node = Mock()
+        node.cmdline.return_value = ["node", r"C:\tools\@anthropic-ai\claude-code\cli.js"]
+        with patch("selfManger.adapters.agents.process_names", return_value=[(10, "codex.exe"), (11, "node.exe"), (12, "unrelated.exe")]) as inventory, patch("psutil.Process", return_value=node) as process:
+            result = AgentAdapter().external_pids_many([codex, claude])
+        self.assertEqual(result, {codex.id: [10], claude.id: [11]})
+        inventory.assert_called_once()
+        process.assert_called_once_with(11)
+
+# tests/test_performance.py :: test_native_inventory_contains_the_current_process
+    def test_native_inventory_contains_the_current_process(self):
+        self.assertIn(os.getpid(), {pid for pid, name in process_names()})
+
+# tests/test_maintenance.py :: test_automatic_backup_skips_locked_credentials_and_running_agents
+    def test_automatic_backup_skips_locked_credentials_and_running_agents(self):
+        self.assertTrue(self.service.automatic_backup(self.resource, self.context)["skipped"])
+        self.resource.kind = "agent"
+        with patch.object(self.service.registry.get(self.resource), "external_pids", return_value=[123]):
+            self.assertTrue(self.service.automatic_backup(self.resource, self.context)["skipped"])
+        self.assertFalse(self.service.backup_root().exists())
+
+# tests/test_maintenance.py :: test_active_wal_database_backup_includes_committed_rows_without_wal_files
+    def test_active_wal_database_backup_includes_committed_rows_without_wal_files(self):
+        records = self.root / "records"
+        records.mkdir()
+        connection = sqlite3.connect(records / "work.db")
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE messages (body TEXT)")
+        connection.execute("INSERT INTO messages VALUES ('fixture-new-message')")
+        connection.commit()
+        self.assertTrue((records / "work.db-wal").exists())
+        resource = Resource("运行中的数据库", "agent", {"portable_bundle": True, "record_paths": [str(records)]})
+        result = self.service.backup(resource, self.context, self.password)
+        target = self.root / "restored"
+        plan = self.service.plan_restore(resource, self.context, source=result["archive"], target=str(target), password=self.password)
+        self.service.restore(resource, plan, self.context, self.password)
+        with closing(sqlite3.connect(target / "records/work.db")) as db:
+            self.assertEqual(db.execute("SELECT body FROM messages").fetchone()[0], "fixture-new-message")
+        self.assertFalse((target / "records/work.db-wal").exists())
+
+# tests/test_maintenance.py :: test_read_only_search_does_not_return_credentials_or_modify_records
+    def test_read_only_search_does_not_return_credentials_or_modify_records(self):
+        records = self.root / "records"
+        records.mkdir()
+        (records / "chat.jsonl").write_text(json.dumps({"payload": {"role": "user", "content": "fixture-project-name"}}))
+        (records / "auth.json").write_text('{"token":"fixture-project-name-secret"}')
+        resource = Resource("测试 Agent", "agent", {"record_paths": [str(records)], "portable_bundle": True})
+        result = search_local([resource], "fixture-project-name", self.context)
+        self.assertEqual(len(result["matches"]), 1)
+        self.assertNotIn("secret", str(result))
+        self.assertEqual(len(self.store.tasks()), 0)
+
+# tests/test_maintenance.py :: test_ssh_login_and_known_hosts_are_explicit_and_environment_import_excludes_passwords
+    def test_ssh_login_and_known_hosts_are_explicit_and_environment_import_excludes_passwords(self):
+        known = self.root / "known_hosts"
+        known.write_text("fixture-host-key")
+        options = {"host": "hermes-server", "user": "root", "known_hosts": str(known)}
+        command = ssh_command(Resource("server", "hermes_server", options), {"action": "observe"})
+        self.assertIn("-l", command)
+        self.assertIn("root", command)
+        self.assertIn("UserKnownHostsFile=" + str(known), command)
+        with patch.dict("os.environ", {"HERMES_SERVER_USER": "root", "HERMES_SERVER_PASSWORD": "fixture-private"}, clear=True), patch("pathlib.Path.home", return_value=self.root):
+            imported = existing_connection()
+        self.assertEqual(imported["user"], "root")
+        self.assertNotIn("fixture-private", str(imported))
+
+# tests/test_ui.py :: test_reading_records_returns_content_without_persisting_it_in_task_history
+    def test_reading_records_returns_content_without_persisting_it_in_task_history(self):
+        outcomes = []
+        self.window.submit(None, "浏览记录", lambda context: {"text": "fixture-private-conversation"}, outcomes.append, persist_result=False)
+        deadline = time.monotonic() + 10
+        while self.window.jobs and time.monotonic() < deadline:
+            QTest.qWait(20)
+        self.assertEqual(outcomes, [{"text": "fixture-private-conversation"}])
+        task = self.store.tasks()[0]
+        self.assertEqual(task["state"], "success")
+        self.assertNotIn("fixture-private-conversation", task["result"] + task["log"])
+
+# tests/test_ui_management.py :: test_new_computer_restore_gui_pipeline_restores_files_database_and_registration
+    def test_new_computer_restore_gui_pipeline_restores_files_database_and_registration(self):
+        project, records = self.root / "source-project", self.root / "source-records"
+        project.mkdir()
+        records.mkdir()
+        (project / "成果.md").write_text("中文成果", encoding="utf-8")
+        (records / "chat.jsonl").write_text('{"role":"user","content":"fixture-chat-history"}', encoding="utf-8")
+        (records / "attachment.bin").write_bytes(bytes(range(256)))
+        with closing(sqlite3.connect(records / "state.sqlite")) as db, db:
+            db.execute("CREATE TABLE sessions(title TEXT)")
+            db.execute("INSERT INTO sessions VALUES('fixture-database-history')")
+        original = Resource("跨电脑测试 Agent", "agent", {"engine": "其他 Agent", "path": str(project), "record_paths": [str(records)], "portable_bundle": True})
+        password = "fixture-backup-password"
+        # Synthetic SQLite fixture: inherit test-root ACLs without changing the
+        # production snapshot directory's private permissions or global tempfile.
+        with patch("selfManger.snapshots.tempfile", SimpleNamespace(
+                TemporaryDirectory=lambda **_: TestDirectory())):
+            backup = archives.create_archive(original, self.root / "transfer-backups", password, TaskContext())
+        target = self.root / "fresh-computer"
+        def choose(dialog):
+            dialog.target.setText(str(target))
+            for key, field in dialog.folder_fields.items():
+                field.setText("新项目" if key == "project" else "新记录")
+            return QDialog.DialogCode.Accepted
+        with patch.object(self.window, "password_input", return_value=(password, False)), patch.object(TransferDialog, "exec", choose), \
+             patch.object(PlanDialog, "exec", return_value=QDialog.DialogCode.Accepted), patch("selfManger.ui.window.QMessageBox.information") as done, \
+             patch("selfManger.ui.window.QMessageBox.warning") as warnings:
+            self.window.import_backup(backup["archive"])
+            self.wait_jobs()
+            self.assertFalse(warnings.called, str(self.store.tasks()))
+            self.assertTrue(done.called)
+        self.assertEqual((target / "新项目/成果.md").read_text(encoding="utf-8"), "中文成果")
+        self.assertEqual((target / "新记录/attachment.bin").read_bytes(), bytes(range(256)))
+        with closing(sqlite3.connect(target / "新记录/state.sqlite")) as db:
+            self.assertEqual(db.execute("SELECT title FROM sessions").fetchone()[0], "fixture-database-history")
+        restored = self.store.resources()[0]
+        self.assertEqual([Path(path).resolve() for path in restored.options["record_paths"]], [(target / "新记录").resolve()])
+        self.assertNotIn("executable", restored.options)
+        self.assertNotIn("fixture-chat-history", str(self.store.tasks()))
+
+# tests/test_simplified_manager.py :: test_codex_backup_excludes_runtime_locks_and_restores_complete_jsonl_and_sqlite
+    def test_codex_backup_excludes_runtime_locks_and_restores_complete_jsonl_and_sqlite(self):
+        import sqlite3
+        home = self.root / "codex"
+        (home / "sessions").mkdir(parents=True)
+        transcript = b'{"type":"event_msg","payload":{"text":"fixture"}}\n{"incomplete":'
+        (home / "sessions/rollout.jsonl").write_bytes(transcript)
+        (home / "config.toml").write_text('model="fixture"')
+        for name in (".sandbox", ".sandbox-secrets", "thread-writer-locks"):
+            (home / name).mkdir()
+            (home / name / "unreadable.lock").write_bytes(b"must exclude")
+        guard = home / ".codex-provisioning-fixture.guard"
+        guard.write_bytes(b"must exclude")
+        with closing(sqlite3.connect(home / "state.sqlite")) as db:
+            db.execute("CREATE TABLE records (id INTEGER)")
+            db.execute("INSERT INTO records VALUES (1)")
+            db.commit()
+        resource = Resource("Codex", "agent", {"engine": "Codex", "record_paths": [str(home)], "portable_bundle": True})
+        original_open = Path.open
+        def blocked(path, *args, **kwargs):
+            if path == guard or any(part in {".sandbox", ".sandbox-secrets", "thread-writer-locks"} for part in path.parts):
+                raise PermissionError("fixture locked")
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, "open", blocked):
+            report = archives.create_archive(resource, self.root / "backup", "fixture-password", self.context)
+        self.assertEqual(report["file_count"], 3)
+        target = self.root / "restored"
+        plan = archives.plan_restore(resource, Path(report["archive"]), target, "fixture-password", self.context)
+        archives.apply_restore(plan, "fixture-password", self.context)
+        restored = next(target.rglob("rollout.jsonl"))
+        self.assertEqual(restored.read_bytes(), transcript.splitlines(keepends=True)[0])
+        with closing(sqlite3.connect(next(target.rglob("state.sqlite")))) as db:
+            self.assertEqual(db.execute("SELECT id FROM records").fetchall(), [(1,)])
+        self.assertFalse(list(target.rglob("*.lock")))
+
+# tests/test_simplified_manager.py :: test_required_unreadable_file_reports_path_and_does_not_create_archive
+    def test_required_unreadable_file_reports_path_and_does_not_create_archive(self):
+        home = self.root / "records"
+        home.mkdir()
+        config = home / "config.toml"
+        config.write_text("fixture")
+        original = Path.open
+        def fail(path, *args, **kwargs):
+            if path == config:
+                raise PermissionError()
+            return original(path, *args, **kwargs)
+        resource = Resource("Codex", "agent", {"engine": "Codex", "record_paths": [str(home)], "portable_bundle": True})
+        with patch.object(Path, "open", fail), self.assertRaisesRegex(UserError, "config.toml"):
+            archives.create_archive(resource, self.root / "backups", "fixture-password", self.context)
+        self.assertFalse(list((self.root / "backups").glob("*.amb")))
+
+# tests/test_simplified_manager.py :: test_two_server_profiles_select_separate_display_paths_with_shared_backup_scope
+    @unittest.skip("legacy ResourcePage has no navigation entry and refresh_resources() only refreshes safety_page, so page.rows stays empty; remove together with the unused pages")
+    def test_two_server_profiles_select_separate_display_paths_with_shared_backup_scope(self):
+        store = Store(self.root / "data")
+        for name in ["pigzhulin", "gugu"]:
+            store.save_resource(Resource(name, "hermes_server", {"home": "/shared/.hermes", "profile_name": name, "profile_home": "/shared/.hermes/profiles/" + name}))
+        window = MainWindow(store)
+        page = window.resource_pages[1]
+        row = next(i for i, r in enumerate(page.rows) if r.name == "gugu")
+        page.selector.setCurrentIndex(row)
+        self.assertEqual(page.selected().name, "gugu")
+        self.assertIn("/profiles/gugu", page.details.toPlainText())
+        self.assertIn("共用网关", page.details.toPlainText())
+        self.assertEqual(page.selected().options["home"], "/shared/.hermes")
+        window.close()

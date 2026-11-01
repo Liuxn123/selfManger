@@ -1,0 +1,35 @@
+name: Save verified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Desktop CI and packages run ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: selfManger-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Save previously verified packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFIED_RUN_ID: ${{ inputs.run_id }}
+          PYTHONUTF8: "1"
+        run: python -u scripts/publish_release.py --publish --run-id "$VERIFIED_RUN_ID"

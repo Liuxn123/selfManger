@@ -1,0 +1,86 @@
+import hashlib
+import sqlite3
+import unittest
+from tests.support import TestDirectory
+import types
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
+
+from selfManger.domain import Resource, UserError
+from selfManger.hermes_library import list_library, read_item
+from selfManger.runtime import TaskContext
+from selfManger.adapters.server import ServerHermesAdapter
+from selfManger.adapters.server_worker import SERVER_PROGRAM
+
+
+class HermesLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = TestDirectory()
+        self.home = Path(self.temporary.name)
+        self.resource = Resource("Hermes", "hermes_local", {"home": str(self.home)})
+        self.context = TaskContext()
+        with closing(sqlite3.connect(self.home / "state.db")) as db, db:
+            db.executescript("CREATE TABLE sessions(id TEXT PRIMARY KEY,title TEXT,started_at REAL,last_activity_at REAL,hidden INTEGER,source TEXT);"
+                             "CREATE TABLE messages(id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,active INTEGER);")
+            db.executemany("INSERT INTO sessions VALUES(?,?,?,?,?,?)", [("visible", "工作规划", 10, 20, 0, "cli"), ("hidden", "隐藏内容", 20, 30, 1, "cli")])
+            db.executemany("INSERT INTO messages(session_id,role,content,active) VALUES(?,?,?,?)",
+                           [("visible", "user", f"message-{i}", 1) for i in range(25)] +
+                           [("visible", "system", "private-system-prompt", 1), ("visible", "tool", "private-tool-output", 1),
+                            ("visible", "assistant", "discarded-content", 0), ("visible", "assistant", "password=fixture-secret\n" + "a" * 3000, 1)])
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_catalog_preview_are_bounded_private_and_read_only(self):
+        before = hashlib.sha256((self.home / "state.db").read_bytes()).hexdigest()
+        report = list_library(self.resource, self.context)
+        self.assertEqual([row["id"] for row in report["sessions"]], ["visible"])
+        self.assertIn("最多列 100 个近期会话", report["note"])
+        text = read_item(self.resource, "session", "visible", self.context)["text"]
+        for absent in ("message-0\n", "message-5\n", "private-system-prompt", "private-tool-output", "discarded-content", "fixture-secret"):
+            self.assertNotIn(absent, text)
+        self.assertIn("message-6", text)
+        self.assertLess(text.count("a"), 2500)
+        self.assertEqual(before, hashlib.sha256((self.home / "state.db").read_bytes()).hexdigest())
+
+    def test_hidden_sessions_and_path_traversal_cannot_be_read(self):
+        for category, identity in [("session", "hidden"), ("session", "visible' OR 1=1--"), ("skill", "../../SKILL.md")]:
+            with self.assertRaises(UserError):
+                read_item(self.resource, category, identity, self.context)
+
+    def test_committed_wal_messages_are_visible(self):
+        with closing(sqlite3.connect(self.home / "state.db")) as writer, writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("INSERT INTO messages(session_id,role,content,active) VALUES('visible','assistant','committed-wal-message',1)")
+            writer.commit()
+            self.assertIn("committed-wal-message", read_item(self.resource, "session", "visible", self.context)["text"])
+
+    def test_remote_logs_redact_credentials(self):
+        text = ('password=fixture-secret\nwss://example.test/ws?device_id=123&access_key=fixture-access-key&service_id=7&ticket=fixture-ticket\n'
+                'Authorization: Bearer fixture-bearer-token\n{"secret": "fixture secret with spaces", "state": "ready"}\nGateway ready')
+        with patch.object(ServerHermesAdapter, "_run", return_value={"text": text}) as run:
+            result = ServerHermesAdapter().logs(Resource("Server", "hermes_server"), self.context)
+        self.assertEqual(run.call_args.args[1], "logs")
+        for value in ("fixture-secret", "fixture-access-key", "fixture-ticket", "fixture-bearer-token", "fixture secret with spaces"):
+            self.assertNotIn(value, result["text"])
+        self.assertIn("service_id=7", result["text"])
+        self.assertIn("Gateway ready", result["text"])
+
+    def test_server_log_command_is_scoped_bounded_and_cannot_change_service(self):
+        namespace = {}
+        with patch.dict("sys.modules", {"pwd": types.ModuleType("pwd")}):
+            exec(SERVER_PROGRAM.split("\ntry:\n    config =", 1)[0], namespace)
+        for scope in ("system", "user"):
+            execute = unittest.mock.Mock(return_value="x" * 50000)
+            namespace["execute"] = execute
+            config = {"action": "logs", "home": "/home/hermes/.hermes", "backup_repo": "/backup", "knowledge_repo": "/knowledge",
+                      "service": "hermes-gateway.service", "service_scope": scope}
+            result = namespace["main"](config)
+            self.assertEqual(len(result["text"]), 40000)
+            execute.assert_called_once_with(["journalctl", *(["--user"] if scope == "user" else []), "--no-pager", "-n", "80", "-u", "hermes-gateway.service", "-o", "short-iso"], timeout=30)
+            execute.reset_mock()
+            config["service"] = "-bad.service"
+            with self.assertRaisesRegex(RuntimeError, "invalid_service"):
+                namespace["main"](config)
+            execute.assert_not_called()

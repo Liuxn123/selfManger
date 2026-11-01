@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import shutil
+import subprocess
+import unittest
+from tests.support import TestDirectory
+from pathlib import Path
+from unittest.mock import patch
+from contextlib import closing
+
+from selfManger import archives
+from selfManger.application import ApplicationService
+from selfManger.domain import Resource, UserError
+from selfManger.profiles import discover_record_paths, restored_resource
+from selfManger.records import list_records, read_record
+from selfManger.runtime import TaskContext
+from selfManger.storage import Store
+
+
+class PortabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = TestDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.project = self.root / "old-computer/project"
+        self.records = self.root / "old-computer/codex"
+        self.project.mkdir(parents=True)
+        (self.records / "sessions").mkdir(parents=True)
+        (self.project / "成果.md").write_text("项目成果", encoding="utf-8")
+        (self.records / "sessions/chat.jsonl").write_text(json.dumps({"type": "response_item", "payload": {"role": "user", "content": [{"type": "input_text", "text": "我的测试问题"}]}}) + "\n" + json.dumps({"payload": {"role": "assistant", "content": [{"text": "我的测试回答"}]}}), encoding="utf-8")
+        (self.records / "auth.json").write_text('{"token":"fixture-login-material"}', encoding="utf-8")
+        with closing(sqlite3.connect(self.records / "state.sqlite")) as db, db:
+            db.execute("create table threads (title text)")
+            db.execute("insert into threads values ('fixture-thread')")
+        self.resource = Resource("我的 Codex 资料", "agent", {"engine": "Codex", "path": str(self.project), "record_paths": [str(self.records)], "portable_bundle": True})
+        self.context = TaskContext()
+        self.password = "fixture-backup-password"
+
+    def backup(self):
+        result = archives.create_archive(self.resource, self.root / "backups", self.password, self.context)
+        return Path(result["archive"])
+
+    def test_one_file_recovers_project_records_database_and_registration_on_fresh_computer(self):
+        source = self.backup()
+        self.assertNotIn(b"fixture-login-material", source.read_bytes())
+        report = archives.verify_archive(source, self.password, self.context)
+        target = self.root / "new-computer"
+        placeholder = Resource(report["resource_name"], report["kind"], {}, report["resource_id"])
+        folders = {"project": "我的项目", "records": "我的记录"}
+        plan = archives.plan_restore(placeholder, source, target, self.password, self.context, folders)
+        archives.apply_restore(plan, self.password, self.context)
+        restored = restored_resource(report, target, folders)
+        store = Store(self.root / "fresh-manager")
+        store.save_resource(restored)
+        self.assertEqual(store.resources()[0].id, self.resource.id)
+        self.assertEqual((target / "我的项目/成果.md").read_text(encoding="utf-8"), "项目成果")
+        self.assertEqual((target / "我的记录/auth.json").read_bytes(), (self.records / "auth.json").read_bytes())
+        with closing(sqlite3.connect(target / "我的记录/state.sqlite")) as db:
+            self.assertEqual(db.execute("select title from threads").fetchone()[0], "fixture-thread")
+        self.assertNotIn("executable", restored.options)
+        records = list_records(restored, self.context)["records"]
+        chat = next(item for item in records if item["name"].endswith("chat.jsonl"))
+        rendered = read_record(restored, chat["path"], self.context)["text"]
+        self.assertIn("你\n我的测试问题", rendered)
+        self.assertIn("Agent\n我的测试回答", rendered)
+        self.assertFalse(any(item["name"] == "auth.json" for item in records))
+
+    def test_records_only_and_wrong_password_restore_are_supported(self):
+        self.resource.options["path"] = ""
+        source = self.backup()
+        target = self.root / "records-only"
+        with self.assertRaises(UserError):
+            archives.plan_restore(self.resource, source, target, "wrong", self.context)
+        self.assertFalse(target.exists())
+        plan = archives.plan_restore(self.resource, source, target, self.password, self.context)
+        archives.apply_restore(plan, self.password, self.context)
+        self.assertTrue((target / "records/sessions/chat.jsonl").is_file())
+
+    @unittest.skipUnless(shutil.which("git"), "Git unavailable")
+    def test_agent_bundle_keeps_work_files_without_inspecting_project_git(self):
+        def git(*arguments):
+            return subprocess.run(["git", "-C", str(self.project), *arguments], check=True, capture_output=True, text=True).stdout.strip()
+        git("init")
+        git("add", ".")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture")
+        (self.project / "成果.md").write_text("未提交成果", encoding="utf-8")
+        with patch("selfManger.archives.subprocess.run", side_effect=AssertionError("Project Git must not be inspected")):
+            source = self.backup()
+        target = self.root / "git-restore"
+        plan = archives.plan_restore(self.resource, source, target, self.password, self.context)
+        archives.apply_restore(plan, self.password, self.context)
+        bundle = target / "project/.selfManger-history.bundle"
+        self.assertFalse(bundle.exists())
+        self.assertFalse((target / "project/.git").exists())
+        self.assertEqual((target / "project/成果.md").read_text(encoding="utf-8"), "未提交成果")
+
+    def test_folder_traversal_collisions_and_destination_inside_records_are_rejected(self):
+        source = self.backup()
+        for folders in [{"project": "../escape", "records": "records"}, {"project": "same", "records": "SAME"}, {"project": "parent", "records": "parent/child"}]:
+            with self.assertRaises(UserError):
+                archives.plan_restore(self.resource, source, self.root / "restore", self.password, self.context, folders)
+        with self.assertRaises(UserError):
+            archives.create_archive(self.resource, self.records / "backup", self.password, self.context)
+
+    def test_record_directory_is_locked_against_another_project_backup(self):
+        service = ApplicationService(Store(self.root / "manager"))
+        competing = Resource("other", "project", {"path": str(self.records / "sessions")})
+        with service.locks.acquire(service.lock_keys(self.resource)):
+            with self.assertRaises(UserError):
+                service.backup(competing, self.context, self.password)
+
+    def test_record_reader_refuses_credentials_and_outside_files(self):
+        for path in [self.records / "auth.json", self.root / "outside.txt"]:
+            if not path.exists():
+                path.write_text("outside")
+            with self.assertRaises(UserError):
+                read_record(self.resource, str(path), self.context)
+
+    def test_discovery_uses_codex_home_without_reading_or_creating_any_data(self):
+        with patch.dict(os.environ, {"CODEX_HOME": str(self.records), "CODEX_SQLITE_HOME": str(self.records / "sessions")}):
+            self.assertEqual(discover_record_paths("Codex"), [self.records.resolve()])

@@ -1,0 +1,29 @@
+Archived cases for removed UI/physical relocation interfaces.
+
+    def test_agent_repository_button_runs_background_job_and_vault_git_is_explicit(self):
+        repository = self.root / "agent-backups"
+        self.store.set_setting("agent_backup_repository", str(repository))
+        self.window.refresh_agent_repository()
+        self.window.open_backup_history()
+        self.window.resize(960, 660)
+        self.app.processEvents()
+        self.assertIn(str(repository), self.window.agent_repository_label.text())
+        self.assertGreater(self.window.agent_repository_label.width(), 150)
+        with patch("selfManger.ui.window.QMessageBox.information") as completed, patch("selfManger.ui.window.QMessageBox.warning") as warnings:
+            self.window.organize_agent_repository()
+            deadline = time.monotonic() + 10
+            while self.window.jobs and time.monotonic() < deadline:
+                QTest.qWait(20)
+                time.sleep(0.005)
+            self.assertFalse(self.window.jobs)
+            self.assertFalse(warnings.called, self.store.tasks()[0]["result"])
+            self.assertEqual(self.store.tasks()[0]["state"], "success")
+            self.assertIn("当前尚无 Agent 备份", completed.call_args[0][2])
+        self.assertTrue((repository / "catalog.json").is_file())
+        dialog = ResourceDialog(self.window, "vault")
+        self.assertFalse(dialog.manage_git.isChecked())
+        dialog.fields["path"].setText(str(self.root))
+        dialog.manage_git.setChecked(True)
+        dialog.save()
+        self.assertTrue(dialog.result_resource.options["manage_git"])
+

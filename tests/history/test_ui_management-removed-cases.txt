@@ -1,0 +1,14 @@
+Archived cases for removed UI/physical relocation interfaces.
+
+    def test_dashboard_focuses_missing_backups_and_failed_operations(self):
+        resource = Resource("待处理项目", "project", {"path": str(self.root)})
+        self.store.save_resource(resource)
+        self.store.start_task("fixturefailed", resource.id, "恢复预览")
+        self.store.finish_task("fixturefailed", "failed", {"error": "fixture failure"})
+        self.window.refresh_resources()
+        self.assertIn("最近操作失败或中断", self.window.pending_items.item(0).toolTip())
+        self.window.open_dashboard_item(self.window.pending_items.item(0))
+        self.assertEqual(self.window.navigation.currentRow(), self.window.SAFETY)
+        self.assertEqual(self.window.task_rows[0]["resource_id"], resource.id)
+        self.assertNotIn("搜索本地记录", [button.text() for button in self.window.stack.widget(0).findChildren(QPushButton)])
+

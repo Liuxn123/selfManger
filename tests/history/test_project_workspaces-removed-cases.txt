@@ -1,0 +1,39 @@
+Archived cases for removed UI/physical relocation interfaces.
+
+    def test_changed_project_and_conflicting_destination_prevent_move(self):
+        project = self.create()
+        plan = self.workspace.plan_move(project["project_id"], False, self.context)
+        (Path(project["directory"]) / "new.txt").write_text("new")
+        with self.assertRaises(UserError):
+            self.workspace.move(plan, "归档", self.context)
+        self.assertTrue(Path(project["directory"]).exists())
+        Path(plan["target"]).mkdir()
+        with self.assertRaises(UserError):
+            self.workspace.plan_move(project["project_id"], False, self.context)
+
+    def test_failed_move_leaves_receipt_and_does_not_report_success(self):
+        project = self.create()
+        plan = self.workspace.plan_move(project["project_id"], False, self.context)
+        with patch.object(self.workspace, "update_indexes", side_effect=OSError("injected index failure")):
+            with self.assertRaisesRegex(UserError, "保留目录"):
+                self.workspace.move(plan, "归档", self.context)
+        self.assertTrue(Path(plan["target"]).exists())
+        receipt = next((self.root / "agent/history").glob("*-move.json"))
+        record = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "needs_review")
+        self.assertEqual(record["phase"], "update_indexes")
+        self.assertIn("injected index failure", record["error"])
+
+    def test_failure_before_rename_verifies_original_files_and_records_error(self):
+        project = self.create()
+        plan = self.workspace.plan_move(project["project_id"], False, self.context)
+        with patch("selfManger.project_workspaces.os.rename", side_effect=PermissionError("directory occupied")):
+            with self.assertRaisesRegex(UserError, "目录未移动"):
+                self.workspace.move(plan, "归档", self.context)
+        self.assertEqual(self.workspace.manifest(Path(plan["source"]), self.context), plan["records"])
+        self.assertFalse(Path(plan["target"]).exists())
+        record = json.loads(next((self.root / "agent/history").glob("*-move.json")).read_text(encoding="utf-8"))
+        self.assertEqual(record["state"], "failed_before_move")
+        self.assertEqual(record["phase"], "rename_directory")
+        self.assertIn("directory occupied", record["error"])
+

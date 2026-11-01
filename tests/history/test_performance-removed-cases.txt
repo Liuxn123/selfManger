@@ -1,0 +1,36 @@
+Archived cases for removed UI/physical relocation interfaces.
+
+    def test_slow_status_scan_runs_off_gui_thread_and_does_not_queue_duplicates(self):
+        resource = Resource("Codex", "agent", {"engine": "Codex", "record_paths": [str(self.root)]})
+        self.store.save_resource(resource)
+        adapter = self.window.service.registry.get(resource)
+        self.window.navigation.setCurrentRow(self.window.SAFETY)
+        self.window.safety_tabs.setCurrentIndex(3)
+        self.until(lambda: self.window.agent_status_worker is None)
+        gate, entered = threading.Event(), threading.Event()
+        threads, ticks = [], []
+        def scan(resources, cancel):
+            threads.append(threading.get_ident())
+            entered.set()
+            gate.wait(10)
+            return {resource.id: [123]}
+        timer = QTimer(); timer.setInterval(5); timer.timeout.connect(lambda: ticks.append(1))
+        timer.start()
+        with patch.object(adapter, "external_pids_many", side_effect=scan) as inventory:
+            try:
+                self.window.refresh_agent_activity()
+                worker = self.window.agent_status_worker
+                self.window.refresh_agent_activity()
+                self.assertIs(self.window.agent_status_worker, worker)
+                self.until(entered.is_set)
+                ticks.clear()
+                # macOS offscreen timers may coalesce; prove responsiveness while the
+                # worker remains blocked, without assuming a 5 ms wall-clock cadence.
+                self.until(lambda: len(ticks) > 3)
+                self.assertNotEqual(threads, [threading.get_ident()])
+            finally:
+                gate.set()
+                self.until(lambda: self.window.agent_status_worker is None)
+                timer.stop()
+            inventory.assert_called_once()
+

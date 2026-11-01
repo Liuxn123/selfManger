@@ -1,0 +1,8 @@
+# Direct build dependencies pinned to the initially verified toolchain.
+# Transitive dependencies resolve separately for each operating system.
+PySide6==6.11.2
+cryptography==50.0.2
+keyring==25.7.0
+PyInstaller==6.22.3
+psutil==7.2.2
+PyYAML==6.0.3
