@@ -2,6 +2,8 @@
 
 日期：2026-10-19；任务：T-109。
 
+> 历史诊断与方案记录；不是当前实施计划。原始探针和结果保存在未随仓库分发的忽略目录中，无法从克隆仓库直接重跑。当前可复现的性能测试和基准范围见[性能说明](PERFORMANCE.md)及相关测试。
+
 ## 结论
 
 当前卡顿有三条已复现的主要路径：模块切换触发跨页面重复刷新；项目读取反复校验整张登记表；知识库长写事务阻塞 UI 线程写任务记录。长项目文档的主线程解析会进一步放大停顿。
@@ -142,7 +144,7 @@
 | C：项目读取与显示 | workspace 快照、解析缓存、详情签名、页签懒渲染、最近使用后台保存 | 14/100 虚构项目下每轮只完整校验一次登记表；350 KB 日志不全量阻塞 UI；外部编辑可正确失效，联接逃逸仍拒绝 |
 | D：扩展数据规模与收尾 | 行动查询聚合、预览后台化、安全页缓存、队列优先级、启动懒加载 | 1,000 行行动、10,000 项知识、大图、多版本备份场景分别测量；取消过时请求不覆盖新选择；重复切换不持续增加控件/任务/内存 |
 
-建议验收目标（尚未实现）：
+当时建议的验收目标（历史方案，不代表当前验收结果）：
 
 - 同一机器、相同探针配置，热切换 P95 ≤100 ms；单独记录第一屏可用时间与后台稳定时间。
 - 10 ms 心跳在常规切换与扫描并行时 P95 ≤50 ms、最大间隔 ≤100 ms；若环境噪声导致失败，保留原始分布并核查具体主线程调用。
@@ -153,16 +155,4 @@
 
 ## 复现与证据
 
-在源码目录运行（仅操作脚本生成的隔离资料）：
-
-```powershell
-$env:PYTHONPATH='src'
-.venv/Scripts/python.exe qa/performance-20261019/probe.py --label baseline
-.venv/Scripts/python.exe qa/performance-20261019/probe.py --skip-nav-import --label no-nav-import
-.venv/Scripts/python.exe qa/performance-20261019/probe.py --skip-nav-import --long-handoff --label long-handoff
-.venv/Scripts/python.exe qa/performance-20261019/storage_probe.py
-```
-
-结果：`qa/performance-20261019/results-baseline.json`、`results-no-nav-import.json`、`results-long-handoff.json`、`storage-results.json`；对应 `profile-*.txt` 为辅助 profile。早期试跑的 `results.json/profile-main.txt` 保留，不用作最终基线。虚构数据目录保留在同一 qa 目录，以便复查。
-
-限制：未运行真实资料客户端、未读取其他项目正文、未读取真实凭据、未执行备份/恢复或打包版测量；未做完整功能回归、跨平台和正式内存泄漏测试。首次系统临时目录探针因本机权限失败，随后改为项目 qa 下的独立虚构目录并成功运行。两份诊断脚本通过 py_compile。优化实现仍待后续任务执行。
+原始探针脚本、JSON 结果和 profile 曾保存在忽略目录 `qa/performance-20261019/`，未随仓库分发；本节中的测量值是历史记录，不能从当前源码克隆中直接复现。该次诊断只使用合成资料，没有覆盖打包应用或完整用户工作区。若要重跑当前性能基准，请使用[当前性能说明](PERFORMANCE.md)中列出的仓库内脚本；其测量范围与本历史导航探针不同。

@@ -21,7 +21,7 @@
 - 新增 `tests/test_navigation_responsiveness.py`：读取在另一连接持有 SQLite 写锁时仍能完成且不落历史；导航不启动迁移；Git 目录发现按需在后台运行；概览解析和最近使用保存不在 UI 线程；同轮快照只读一次登记文件；下一轮刷新能看到外部 STATUS 修改。
 - `run_tests.py` 只为测试创建项目 qa 下的临时目录，避开本机 Python owner-only 临时目录 ACL 与桌面沙箱不兼容的问题，不改变产品运行环境。
 - 初轮旧性能测试暴露两处兼容问题：隐藏旧控件已销毁、页签切换隐式同步任务文档；上述第 6/7 项修复后，项目/性能/概览相关 19 项通过。最终 Git 按需发现调整后新增 4 项再次通过。
-- 行动中心、实用性、工作区交互、公共 UI 与读取结果隐私回归结果曾记录在本机 QA 目录及本项目 HANDOFF；当前仓库可复核的相关测试包括 [导航响应测试](../tests/test_navigation_responsiveness.py)、[性能测试](../tests/test_performance.py) 与 [行动中心测试](../tests/test_action_center.py)。这些测试不替代未随仓库分发的原始报告。
+- 行动中心、工作区交互与公共 UI 的回归记录未随仓库分发；当前仓库可复核的相关测试包括[导航响应测试](../tests/test_navigation_responsiveness.py)、[性能测试](../tests/test_performance.py)与[行动中心测试](../tests/test_action_center.py)。这些测试不声称覆盖未分发的历史报告。
 
 测量包含 profiler 开销；后台稳定时间与主线程卡住时间分别记录。窗口构造显示、首次点击和后台稳定也分别记录。初轮 14 个项目、348 KB 虚构交接文档实测，导航心跳最长间隔由此前约 339 ms 降至约 81 ms，工作台热切换稳定约 9–10 ms；不代表真实客户端的正式 P95。
 
