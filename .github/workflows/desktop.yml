@@ -11,13 +11,9 @@ permissions:
 
 jobs:
   desktop:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: windows-latest
+    runs-on: windows-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-22.04, macos-15, macos-15-intel]
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
@@ -30,16 +26,6 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-build.txt
-      - name: Install Qt system dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
-      - name: Build static cryptography for Intel macOS
-        if: matrix.os == 'macos-15-intel'
-        env:
-          OPENSSL_STATIC: "1"
-        # Current cryptography releases provide macOS wheels only for ARM64.
-        # A static source build avoids mixing Homebrew and Python OpenSSL ABIs.
-        run: python -m pip install --force-reinstall --no-deps --no-cache-dir --no-binary=cryptography cryptography==50.0.2
       - name: Install
         run: python -m pip install -e ".[build]" -r requirements-build.txt
       - name: Compile and test
@@ -55,7 +41,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: selfManger-${{ matrix.os }}
+          name: selfManger-windows-latest
           path: |
             dist/selfManger-*.zip
             dist/selfManger-*.tar.gz
